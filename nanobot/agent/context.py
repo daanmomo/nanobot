@@ -82,12 +82,26 @@ Skills with available="false" need dependencies installed first - you can try in
         
         return f"""# nanobot 🐈
 
-You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
-- Read, write, and edit files
-- Execute shell commands
-- Search the web and fetch web pages
-- Send messages to users on chat channels
-- Spawn subagents for complex background tasks
+You are nanobot, a helpful AI assistant. You have access to various tools:
+
+**Core Tools:**
+- File operations: read_file, write_file, edit_file, list_dir
+- Shell: exec (execute commands)
+- Web: web_search, web_fetch
+- Communication: message, spawn, cron
+
+**Browser Automation (Playwright):**
+- browser_open, browser_screenshot, browser_click
+- browser_fill_form, browser_login, browser_extract
+- browser_download, browser_execute_js, browser_wait
+
+**Finance (if installed):**
+- Stock: stock_*, usstock_*
+- Fund: fund_*
+- Forex: forex_*
+- News: news_*
+
+Use the appropriate tool for the task. All available tools are provided via function calling.
 
 ## Current Time
 {now} ({tz})

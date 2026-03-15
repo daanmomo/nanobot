@@ -1,5 +1,9 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
+# Build arguments for optional features
+ARG INSTALL_STOCK=false
+ARG INSTALL_RESEARCH=false
+
 # Install Node.js 20 for the WhatsApp bridge
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates gnupg git && \
@@ -25,6 +29,14 @@ COPY nanobot/ nanobot/
 COPY bridge/ bridge/
 RUN uv pip install --system --no-cache .
 
+# Install optional dependencies based on build args
+RUN if [ "$INSTALL_STOCK" = "true" ]; then \
+        uv pip install --system --no-cache akshare pandas; \
+    fi && \
+    if [ "$INSTALL_RESEARCH" = "true" ]; then \
+        uv pip install --system --no-cache markdownify; \
+    fi
+
 # Build the WhatsApp bridge
 WORKDIR /app/bridge
 RUN npm install && npm run build
@@ -35,6 +47,10 @@ RUN mkdir -p /root/.nanobot
 
 # Gateway default port
 EXPOSE 18790
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD nanobot status || exit 1
 
 ENTRYPOINT ["nanobot"]
 CMD ["status"]

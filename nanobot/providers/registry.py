@@ -106,6 +106,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     # === Standard providers (matched by model-name keywords) ===============
 
     # Anthropic: LiteLLM recognizes "claude-*" natively, no prefix needed.
+    # env_extras: ANTHROPIC_API_BASE for custom endpoints (e.g. Novita proxy).
     ProviderSpec(
         name="anthropic",
         keywords=("anthropic", "claude"),
@@ -113,7 +114,9 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         display_name="Anthropic",
         litellm_prefix="",
         skip_prefixes=(),
-        env_extras=(),
+        env_extras=(
+            ("ANTHROPIC_API_BASE", "{api_base}"),
+        ),
         is_gateway=False,
         is_local=False,
         detect_by_key_prefix="",
@@ -256,6 +259,25 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_key_prefix="",
         detect_by_base_keyword="",
         default_api_base="https://api.minimax.io/v1",
+        strip_model_prefix=False,
+        model_overrides=(),
+    ),
+
+    # ARK (Volcengine/火山引擎): OpenAI-compatible API for DeepSeek and other models.
+    # Models use endpoint IDs like "ep-20250208120224-xbzvk".
+    ProviderSpec(
+        name="ark",
+        keywords=("ark", "ep-"),             # ep- prefix for endpoint IDs
+        env_key="ARK_API_KEY",
+        display_name="ARK",
+        litellm_prefix="openai",             # OpenAI-compatible
+        skip_prefixes=("openai/",),
+        env_extras=(),
+        is_gateway=False,
+        is_local=True,                       # treated as local/custom deployment
+        detect_by_key_prefix="",
+        detect_by_base_keyword="volces",     # detect by api_base containing "volces"
+        default_api_base="https://ark.cn-beijing.volces.com/api/v3",
         strip_model_prefix=False,
         model_overrides=(),
     ),

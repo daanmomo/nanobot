@@ -1,7 +1,8 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
+
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings
 
 
@@ -21,13 +22,16 @@ class TelegramConfig(BaseModel):
 
 
 class FeishuConfig(BaseModel):
-    """Feishu/Lark channel configuration using WebSocket long connection."""
+    """飞书 (Feishu) 渠道配置，使用 WebSocket 长连接。"""
+    model_config = ConfigDict(populate_by_name=True)
+
     enabled: bool = False
-    app_id: str = ""  # App ID from Feishu Open Platform
-    app_secret: str = ""  # App Secret from Feishu Open Platform
-    encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
-    verification_token: str = ""  # Verification Token for event subscription (optional)
-    allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
+    app_id: str = Field(default="", alias="appId")  # App ID from Feishu Open Platform
+    app_secret: str = Field(default="", alias="appSecret")  # App Secret from Feishu Open Platform
+    domain: str = "feishu"  # "feishu" 飞书国内 (open.feishu.cn)，"lark" 国际版 (open.larksuite.com)
+    encrypt_key: str = Field(default="", alias="encryptKey")  # Encrypt Key for event subscription (optional)
+    verification_token: str = Field(default="", alias="verificationToken")  # Verification Token for event subscription (optional)
+    allow_from: list[str] = Field(default_factory=list, alias="allowFrom")  # Allowed user open_ids
 
 
 class DingTalkConfig(BaseModel):
@@ -45,6 +49,7 @@ class DiscordConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs
     gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
     intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
+    proxy: str | None = None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890"
 
 class EmailConfig(BaseModel):
     """Email channel configuration (IMAP inbound + SMTP outbound)."""
@@ -141,6 +146,39 @@ class QQConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public access)
 
 
+class WeChatConfig(BaseModel):
+    """WeChat channel configuration."""
+    enabled: bool = False
+    mode: str = "websocket"  # "websocket" or "wechaty"
+    # WebSocket bridge mode
+    bridge_url: str = "ws://localhost:3002"  # WebSocket bridge URL
+    # Wechaty mode
+    wechaty_token: str = ""  # Wechaty Puppet Service token
+    wechaty_endpoint: str = ""  # Wechaty Puppet Service endpoint
+    # Behavior
+    require_mention_in_group: bool = False  # Require @mention in group chat
+    allow_from: list[str] = Field(default_factory=list)  # Allowed wxids
+
+
+class WeComConfig(BaseModel):
+    """企业微信 (WeCom/WeChat Work) channel configuration."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    enabled: bool = False
+    corpid: str = ""  # 企业ID
+    corpsecret: str = ""  # 应用Secret
+    agent_id: int = Field(default=0, alias="agentId")  # 应用AgentId
+    token: str = ""  # 用于验证消息签名
+    encoding_aes_key: str = Field(default="", alias="encodingAesKey")  # 消息加解密密钥
+    # 回调服务器配置
+    callback_enabled: bool = Field(default=False, alias="callbackEnabled")
+    callback_host: str = Field(default="0.0.0.0", alias="callbackHost")
+    callback_port: int = Field(default=8080, alias="callbackPort")
+    callback_path: str = Field(default="/wecom/callback", alias="callbackPath")
+    # 访问控制
+    allow_from: list[str] = Field(default_factory=list, alias="allowFrom")  # 允许的用户ID
+
+
 class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
@@ -152,20 +190,61 @@ class ChannelsConfig(BaseModel):
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
+    wechat: WeChatConfig = Field(default_factory=WeChatConfig)
+    wecom: WeComConfig = Field(default_factory=WeComConfig)  # 企业微信
 
 
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.nanobot/workspace"
-    model: str = "anthropic/claude-opus-4-5"
+    model: str = "deepseek/deepseek-chat"  # Default to DeepSeek
     max_tokens: int = 8192
     temperature: float = 0.7
     max_tool_iterations: int = 20
+    memory_window: int = 20
+
+
+class ClawWorkTokenPricing(BaseModel):
+    """ClawWork token pricing (per 1M tokens)."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    input_price: float = Field(default=2.5, alias="inputPrice")
+    output_price: float = Field(default=10.0, alias="outputPrice")
+
+
+class ClawWorkConfig(BaseModel):
+    """ClawWork economic tracking configuration.
+
+    Enable via config.json:
+    {
+      "agents": {
+        "clawwork": {
+          "enabled": true,
+          "signature": "my-agent",
+          "initialBalance": 1000.0,
+          "tokenPricing": {"inputPrice": 2.5, "outputPrice": 10.0}
+        }
+      }
+    }
+    """
+    model_config = ConfigDict(populate_by_name=True)
+
+    enabled: bool = False
+    signature: str = ""  # Agent name (data saved under this directory)
+    initial_balance: float = Field(default=1000.0, alias="initialBalance")
+    token_pricing: ClawWorkTokenPricing = Field(
+        default_factory=ClawWorkTokenPricing, alias="tokenPricing"
+    )
+    task_values_path: str = Field(default="", alias="taskValuesPath")
+    meta_prompts_dir: str = Field(default="./eval/meta_prompts", alias="metaPromptsDir")
+    data_path: str = Field(default="./data/clawwork", alias="dataPath")
+    enable_file_reading: bool = Field(default=True, alias="enableFileReading")
 
 
 class AgentsConfig(BaseModel):
     """Agent configuration."""
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    clawwork: ClawWorkConfig = Field(default_factory=ClawWorkConfig)
 
 
 class ProviderConfig(BaseModel):
@@ -175,8 +254,19 @@ class ProviderConfig(BaseModel):
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
 
 
+class CustomProviderConfig(BaseModel):
+    """Custom LLM provider with custom API endpoint."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    enabled: bool = False  # Disabled by default
+    api_key: str = Field(default="", alias="apiKey")  # API key
+    api_base: str = Field(default="", alias="apiBase")  # Custom API base URL
+    model: str = ""  # Model name to use
+
+
 class ProvidersConfig(BaseModel):
     """Configuration for LLM providers."""
+    custom: CustomProviderConfig = Field(default_factory=CustomProviderConfig)  # Custom settings from file
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -189,6 +279,7 @@ class ProvidersConfig(BaseModel):
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
+    ark: ProviderConfig = Field(default_factory=ProviderConfig)  # 火山引擎 ARK (DeepSeek etc.)
 
 
 class GatewayConfig(BaseModel):
@@ -198,14 +289,24 @@ class GatewayConfig(BaseModel):
 
 
 class WebSearchConfig(BaseModel):
-    """Web search tool configuration."""
+    """Web search tool configuration (Brave Search)."""
     api_key: str = ""  # Brave Search API key
     max_results: int = 5
+
+
+class TencentSearchConfig(BaseModel):
+    """Tencent Search API configuration (for Chinese content)."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    secret_id: str = Field(default="", alias="secretId")
+    secret_key: str = Field(default="", alias="secretKey")
+    endpoint: str = "wsa.tencentcloudapi.com"
 
 
 class WebToolsConfig(BaseModel):
     """Web tools configuration."""
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+    tencent: TencentSearchConfig = Field(default_factory=TencentSearchConfig)
 
 
 class ExecToolConfig(BaseModel):
@@ -227,12 +328,12 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
-    
+
     @property
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
         return Path(self.agents.defaults.workspace).expanduser()
-    
+
     def _match_provider(self, model: str | None = None) -> tuple["ProviderConfig | None", str | None]:
         """Match provider config and its registry name. Returns (config, spec_name)."""
         from nanobot.providers.registry import PROVIDERS
@@ -265,7 +366,7 @@ class Config(BaseSettings):
         """Get API key for the given model. Falls back to first available key."""
         p = self.get_provider(model)
         return p.api_key if p else None
-    
+
     def get_api_base(self, model: str | None = None) -> str | None:
         """Get API base URL for the given model. Applies default URLs for known gateways."""
         from nanobot.providers.registry import find_by_name
@@ -280,7 +381,7 @@ class Config(BaseSettings):
             if spec and spec.is_gateway and spec.default_api_base:
                 return spec.default_api_base
         return None
-    
+
     model_config = ConfigDict(
         env_prefix="NANOBOT_",
         env_nested_delimiter="__"

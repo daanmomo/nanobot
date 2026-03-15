@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, AsyncIterator
 
 
 @dataclass
@@ -14,6 +14,16 @@ class ToolCallRequest:
 
 
 @dataclass
+class StreamChunk:
+    """A chunk of streaming response."""
+    content: str | None = None
+    reasoning_content: str | None = None
+    tool_calls_delta: list[dict[str, Any]] = field(default_factory=list)
+    finish_reason: str | None = None
+    usage: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
 class LLMResponse:
     """Response from an LLM provider."""
     content: str | None
@@ -21,7 +31,7 @@ class LLMResponse:
     finish_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
-    
+
     @property
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
@@ -68,3 +78,36 @@ class LLMProvider(ABC):
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
         pass
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> AsyncIterator[StreamChunk]:
+        """
+        Send a streaming chat completion request.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content'.
+            tools: Optional list of tool definitions.
+            model: Model identifier (provider-specific).
+            max_tokens: Maximum tokens in response.
+            temperature: Sampling temperature.
+
+        Yields:
+            StreamChunk with incremental content, reasoning, or tool calls.
+
+        Note:
+            Default implementation falls back to non-streaming chat.
+            Subclasses should override for true streaming support.
+        """
+        response = await self.chat(messages, tools, model, max_tokens, temperature)
+        yield StreamChunk(
+            content=response.content,
+            reasoning_content=response.reasoning_content,
+            finish_reason=response.finish_reason,
+            usage=response.usage,
+        )
