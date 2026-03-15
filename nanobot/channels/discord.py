@@ -5,15 +5,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+import aiohttp
 import httpx
-import websockets
+from aiohttp_socks import ProxyConnector
 from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import DiscordConfig
-
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
@@ -27,7 +27,8 @@ class DiscordChannel(BaseChannel):
     def __init__(self, config: DiscordConfig, bus: MessageBus):
         super().__init__(config, bus)
         self.config: DiscordConfig = config
-        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._session: aiohttp.ClientSession | None = None
         self._seq: int | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._typing_tasks: dict[str, asyncio.Task] = {}
@@ -40,21 +41,39 @@ class DiscordChannel(BaseChannel):
             return
 
         self._running = True
-        self._http = httpx.AsyncClient(timeout=30.0)
+        # Set up HTTP client with optional proxy
+        http_kwargs: dict[str, Any] = {"timeout": 30.0}
+        if self.config.proxy:
+            http_kwargs["proxy"] = self.config.proxy
+        self._http = httpx.AsyncClient(**http_kwargs)
 
         while self._running:
             try:
                 logger.info("Connecting to Discord gateway...")
-                async with websockets.connect(self.config.gateway_url) as ws:
+                # Create aiohttp session with optional proxy
+                connector = None
+                if self.config.proxy:
+                    connector = ProxyConnector.from_url(self.config.proxy)
+                self._session = aiohttp.ClientSession(connector=connector)
+
+                async with self._session.ws_connect(self.config.gateway_url) as ws:
                     self._ws = ws
                     await self._gateway_loop()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning(f"Discord gateway error: {e}")
+                # Gateway loop exited normally (reconnect requested or session invalid)
                 if self._running:
                     logger.info("Reconnecting to Discord gateway in 5 seconds...")
                     await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Discord gateway error: {e}")
+                if self._running:
+                    logger.info("Reconnecting to Discord gateway in 5 seconds...")
+                    await asyncio.sleep(5)
+            finally:
+                if self._session:
+                    await self._session.close()
+                    self._session = None
 
     async def stop(self) -> None:
         """Stop the Discord channel."""
@@ -68,82 +87,139 @@ class DiscordChannel(BaseChannel):
         if self._ws:
             await self._ws.close()
             self._ws = None
+        if self._session:
+            await self._session.close()
+            self._session = None
         if self._http:
             await self._http.aclose()
             self._http = None
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Discord REST API."""
+        """Send a message through Discord REST API.
+
+        Automatically splits messages that exceed Discord's 2000-character limit.
+        """
         if not self._http:
             logger.warning("Discord HTTP client not initialized")
             return
 
-        url = f"{DISCORD_API_BASE}/channels/{msg.chat_id}/messages"
-        payload: dict[str, Any] = {"content": msg.content}
-
-        if msg.reply_to:
-            payload["message_reference"] = {"message_id": msg.reply_to}
-            payload["allowed_mentions"] = {"replied_user": False}
-
-        headers = {"Authorization": f"Bot {self.config.token}"}
-
         try:
-            for attempt in range(3):
-                try:
-                    response = await self._http.post(url, headers=headers, json=payload)
-                    if response.status_code == 429:
-                        data = response.json()
-                        retry_after = float(data.get("retry_after", 1.0))
-                        logger.warning(f"Discord rate limited, retrying in {retry_after}s")
-                        await asyncio.sleep(retry_after)
-                        continue
-                    response.raise_for_status()
-                    return
-                except Exception as e:
-                    if attempt == 2:
-                        logger.error(f"Error sending Discord message: {e}")
-                    else:
-                        await asyncio.sleep(1)
+            chunks = self._split_message(msg.content)
+            for i, chunk in enumerate(chunks):
+                payload: dict[str, Any] = {"content": chunk}
+
+                # Only set reply reference on the first chunk
+                if i == 0 and msg.reply_to:
+                    payload["message_reference"] = {"message_id": msg.reply_to}
+                    payload["allowed_mentions"] = {"replied_user": False}
+
+                await self._send_payload(msg.chat_id, payload)
         finally:
             await self._stop_typing(msg.chat_id)
+
+    async def _send_payload(self, channel_id: str, payload: dict[str, Any]) -> None:
+        """Send a single payload to Discord with retry logic."""
+        url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages"
+        headers = {"Authorization": f"Bot {self.config.token}"}
+
+        for attempt in range(3):
+            try:
+                response = await self._http.post(url, headers=headers, json=payload)
+                if response.status_code == 429:
+                    data = response.json()
+                    retry_after = float(data.get("retry_after", 1.0))
+                    logger.warning(f"Discord rate limited, retrying in {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    continue
+                response.raise_for_status()
+                return
+            except Exception as e:
+                if attempt == 2:
+                    logger.error(f"Error sending Discord message: {e}")
+                else:
+                    await asyncio.sleep(1)
+
+    @staticmethod
+    def _split_message(content: str, limit: int = 2000) -> list[str]:
+        """Split a message into chunks that fit within Discord's character limit.
+
+        Tries to split at newlines, then spaces, then hard-cuts as a last resort.
+        """
+        if len(content) <= limit:
+            return [content]
+
+        chunks: list[str] = []
+        while content:
+            if len(content) <= limit:
+                chunks.append(content)
+                break
+
+            # Try to split at last newline within limit
+            split_at = content.rfind("\n", 0, limit)
+            if split_at == -1 or split_at < limit // 2:
+                # Try to split at last space within limit
+                split_at = content.rfind(" ", 0, limit)
+            if split_at == -1 or split_at < limit // 2:
+                # Hard cut
+                split_at = limit
+
+            chunks.append(content[:split_at])
+            content = content[split_at:].lstrip("\n")
+
+        return chunks
 
     async def _gateway_loop(self) -> None:
         """Main gateway loop: identify, heartbeat, dispatch events."""
         if not self._ws:
             return
 
-        async for raw in self._ws:
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                logger.warning(f"Invalid JSON from Discord gateway: {raw[:100]}")
-                continue
+        async for msg in self._ws:
+            logger.debug(f"Discord WS message type: {msg.type}")
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid JSON from Discord gateway: {msg.data[:100]}")
+                    continue
 
-            op = data.get("op")
-            event_type = data.get("t")
-            seq = data.get("s")
-            payload = data.get("d")
+                op = data.get("op")
+                event_type = data.get("t")
+                seq = data.get("s")
+                payload = data.get("d")
 
-            if seq is not None:
-                self._seq = seq
+                if seq is not None:
+                    self._seq = seq
 
-            if op == 10:
-                # HELLO: start heartbeat and identify
-                interval_ms = payload.get("heartbeat_interval", 45000)
-                await self._start_heartbeat(interval_ms / 1000)
-                await self._identify()
-            elif op == 0 and event_type == "READY":
-                logger.info("Discord gateway READY")
-            elif op == 0 and event_type == "MESSAGE_CREATE":
-                await self._handle_message_create(payload)
-            elif op == 7:
-                # RECONNECT: exit loop to reconnect
-                logger.info("Discord gateway requested reconnect")
+                if op == 10:
+                    # HELLO: start heartbeat and identify
+                    logger.debug("Discord gateway HELLO received")
+                    interval_ms = payload.get("heartbeat_interval", 45000)
+                    await self._start_heartbeat(interval_ms / 1000)
+                    await self._identify()
+                    logger.debug("Discord IDENTIFY sent")
+                elif op == 0 and event_type == "READY":
+                    logger.info("Discord gateway READY")
+                elif op == 0 and event_type == "MESSAGE_CREATE":
+                    await self._handle_message_create(payload)
+                elif op == 7:
+                    # RECONNECT: exit loop to reconnect
+                    logger.info("Discord gateway requested reconnect")
+                    break
+                elif op == 9:
+                    # INVALID_SESSION: reconnect
+                    logger.warning("Discord gateway invalid session")
+                    break
+            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                close_code = self._ws.close_code if self._ws else None
+                logger.warning(f"Discord WebSocket closed: {msg.type}, code={close_code}")
+                if close_code == 4014:
+                    logger.error("Discord error 4014: Disallowed intents - enable MESSAGE_CONTENT in Developer Portal")
+                elif close_code == 4004:
+                    logger.error("Discord error 4004: Authentication failed - check your bot token")
                 break
-            elif op == 9:
-                # INVALID_SESSION: reconnect
-                logger.warning("Discord gateway invalid session")
-                break
+
+        # Log when loop exits without hitting a break
+        logger.debug(f"Discord gateway loop exited, ws close_code={self._ws.close_code if self._ws else 'N/A'}")
 
     async def _identify(self) -> None:
         """Send IDENTIFY payload."""
@@ -162,7 +238,7 @@ class DiscordChannel(BaseChannel):
                 },
             },
         }
-        await self._ws.send(json.dumps(identify))
+        await self._ws.send_str(json.dumps(identify))
 
     async def _start_heartbeat(self, interval_s: float) -> None:
         """Start or restart the heartbeat loop."""
@@ -173,7 +249,7 @@ class DiscordChannel(BaseChannel):
             while self._running and self._ws:
                 payload = {"op": 1, "d": self._seq}
                 try:
-                    await self._ws.send(json.dumps(payload))
+                    await self._ws.send_str(json.dumps(payload))
                 except Exception as e:
                     logger.warning(f"Discord heartbeat failed: {e}")
                     break
