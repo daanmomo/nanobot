@@ -1,21 +1,63 @@
-.assets
-.env
-*.pyc
-dist/
-build/
-docs/
-*.egg-info/
-*.egg
-*.pyc
+# Python
+__pycache__/
+*.py[cod]
 *.pyo
 *.pyd
 *.pyw
-*.pyz
-*.pywz
-*.pyzz
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
 .venv/
-__pycache__/
-poetry.lock
+venv/
+env/
+
+# IDE / Editor
+.vscode/
+.idea/
+.trae/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
 .pytest_cache/
-tests/
+htmlcov/
+.coverage
+coverage.xml
+
+# Logs
+*.log
 botpy.log
+
+# Environment & secrets
+.env
+.env.*
+
+# nanobot runtime data
+nanobot/tmp/
+
+# Bridge (wechat node project — built separately)
+bridge-wechat/node_modules/
+bridge-wechat/dist/
+
+# Agent IDE configs
+.agents/
+
+# Lock files
+poetry.lock
+skills-lock.json
+
+# Assets
+.assets/
+
+# Documentation build
+docs/
+
+# Claude Code project config (keep CLAUDE.md, ignore internal state)
+.claude/
