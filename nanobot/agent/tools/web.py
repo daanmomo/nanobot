@@ -125,7 +125,9 @@ class WebSearchTool(Tool):
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
         if not self.api_key:
-            return "Error: BRAVE_API_KEY not configured"
+            # Fallback to DuckDuckGo when Brave API key is not configured
+            ddg = DuckDuckGoSearchTool(max_results=self.max_results)
+            return await ddg.execute(query=query, count=count, **kwargs)
 
         try:
             n = min(max(count or self.max_results, 1), 10)
@@ -150,6 +152,72 @@ class WebSearchTool(Tool):
                 lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
                 if desc := item.get("description"):
                     lines.append(f"   {desc}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error: {e}"
+
+
+class DuckDuckGoSearchTool(Tool):
+    """Free web search using DuckDuckGo. No API key required."""
+
+    @property
+    def name(self) -> str:
+        return "ddg_search"
+
+    @property
+    def description(self) -> str:
+        return "Search the web using DuckDuckGo (free, no API key needed). Returns titles, URLs, and snippets."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "count": {
+                    "type": "integer",
+                    "description": "Number of results (1-10)",
+                    "minimum": 1,
+                    "maximum": 10,
+                },
+                "region": {
+                    "type": "string",
+                    "description": "Region for results (e.g. 'cn-zh' for China, 'us-en' for US). Default: 'wt-wt' (no region)",
+                },
+            },
+            "required": ["query"],
+        }
+
+    def __init__(self, max_results: int = 5):
+        self.max_results = max_results
+
+    async def execute(self, query: str, count: int | None = None, region: str = "wt-wt", **kwargs: Any) -> str:
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            try:
+                from duckduckgo_search import DDGS
+            except ImportError:
+                return "Error: ddgs package not installed. Run: pip install ddgs"
+
+        try:
+            n = min(max(count or self.max_results, 1), 10)
+            # DDGS is synchronous, run in executor to avoid blocking
+            import asyncio
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(
+                None,
+                lambda: DDGS().text(query, max_results=n, region=region),
+            )
+
+            if not results:
+                return f"No results for: {query}"
+
+            lines = [f"Results for: {query}\n"]
+            for i, item in enumerate(results[:n], 1):
+                lines.append(f"{i}. {item.get('title', '')}\n   {item.get('href', '')}")
+                if body := item.get("body"):
+                    lines.append(f"   {body}")
             return "\n".join(lines)
         except Exception as e:
             return f"Error: {e}"

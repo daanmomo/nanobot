@@ -23,7 +23,13 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.web import TencentSearchTool, ThinkTool, WebFetchTool, WebSearchTool
+from nanobot.agent.tools.web import (
+    DuckDuckGoSearchTool,
+    TencentSearchTool,
+    ThinkTool,
+    WebFetchTool,
+    WebSearchTool,
+)
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider, LLMResponse, StreamChunk, ToolCallRequest
@@ -131,6 +137,7 @@ class AgentLoop:
 
         # Web tools
         self.tools.register(WebSearchTool(api_key=self.brave_api_key))
+        self.tools.register(DuckDuckGoSearchTool())
         self.tools.register(TencentSearchTool(
             secret_id=self.tencent_config.secret_id,
             secret_key=self.tencent_config.secret_key,
