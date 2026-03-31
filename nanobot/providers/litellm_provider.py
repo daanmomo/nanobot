@@ -64,6 +64,9 @@ class LiteLLMProvider(LLMProvider):
         litellm.suppress_debug_info = True
         # Drop unsupported parameters for providers (e.g., gpt-5 rejects some params)
         litellm.drop_params = True
+        # Auto-fix Anthropic tool params: add dummy tool when messages contain
+        # tool_use blocks but no tools param is provided.
+        litellm.modify_params = True
 
     def _setup_env(self, api_key: str, api_base: str | None, model: str) -> None:
         """Set environment variables based on detected provider."""
@@ -122,6 +125,33 @@ class LiteLLMProvider(LLMProvider):
             except (ConnectionRefusedError, OSError, TimeoutError):
                 continue
         return False
+
+    @staticmethod
+    def _strip_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Strip tool-related messages to avoid Anthropic UnsupportedParamsError.
+
+        When sending a request without tools, Anthropic rejects messages that
+        contain tool_use or tool_result content blocks. This method removes
+        tool result messages and strips tool_calls from assistant messages,
+        preserving the text content so conversation context is not lost.
+        """
+        cleaned = []
+        for msg in messages:
+            # Skip tool result messages entirely
+            if msg.get("role") == "tool":
+                continue
+
+            # Strip tool_calls from assistant messages, keep text content
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                new_msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+                # Ensure there's still content
+                if not new_msg.get("content"):
+                    new_msg["content"] = "(tool call results omitted)"
+                cleaned.append(new_msg)
+                continue
+
+            cleaned.append(msg)
+        return cleaned
 
     @staticmethod
     def _disable_proxy() -> None:
@@ -321,6 +351,14 @@ class LiteLLMProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        else:
+            # Anthropic requires tools param if messages contain tool_use/tool_result.
+            # Strip tool-related messages when no tools are provided to avoid
+            # UnsupportedParamsError.
+            kwargs["messages"] = self._strip_tool_messages(messages)
+
+        # Set generous timeout to avoid cutting off long responses
+        kwargs["timeout"] = 1200  # 20 minutes
 
         try:
             response = await acompletion(**kwargs)
@@ -444,6 +482,13 @@ class LiteLLMProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        else:
+            # Anthropic requires tools param if messages contain tool_use/tool_result.
+            # Strip tool-related messages when no tools are provided.
+            kwargs["messages"] = self._strip_tool_messages(messages)
+
+        # Set generous timeout to avoid cutting off long responses
+        kwargs["timeout"] = 1200  # 20 minutes
 
         try:
             response = await acompletion(**kwargs)

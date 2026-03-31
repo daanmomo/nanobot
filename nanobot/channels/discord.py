@@ -41,23 +41,33 @@ class DiscordChannel(BaseChannel):
             return
 
         self._running = True
-        # Set up HTTP client with optional proxy
+        max_retries = 3
+        retry_count = 0
+
+        # Set up HTTP client — bypass env proxy unless explicitly configured
         http_kwargs: dict[str, Any] = {"timeout": 30.0}
         if self.config.proxy:
             http_kwargs["proxy"] = self.config.proxy
+        else:
+            http_kwargs["proxy"] = None
         self._http = httpx.AsyncClient(**http_kwargs)
 
         while self._running:
             try:
                 logger.info("Connecting to Discord gateway...")
-                # Create aiohttp session with optional proxy
+                # Create aiohttp session — bypass env proxy unless explicitly configured
                 connector = None
                 if self.config.proxy:
                     connector = ProxyConnector.from_url(self.config.proxy)
-                self._session = aiohttp.ClientSession(connector=connector)
+                else:
+                    connector = aiohttp.TCPConnector()
+                self._session = aiohttp.ClientSession(
+                    connector=connector, trust_env=bool(self.config.proxy)
+                )
 
                 async with self._session.ws_connect(self.config.gateway_url) as ws:
                     self._ws = ws
+                    retry_count = 0  # reset on successful connection
                     await self._gateway_loop()
                 # Gateway loop exited normally (reconnect requested or session invalid)
                 if self._running:
@@ -66,9 +76,19 @@ class DiscordChannel(BaseChannel):
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                retry_count += 1
                 logger.error(f"Discord gateway error: {e}")
+                if retry_count >= max_retries:
+                    logger.error(
+                        f"Discord failed to connect after {max_retries} attempts, giving up"
+                    )
+                    self._running = False
+                    break
                 if self._running:
-                    logger.info("Reconnecting to Discord gateway in 5 seconds...")
+                    logger.info(
+                        f"Reconnecting to Discord gateway in 5 seconds "
+                        f"(attempt {retry_count}/{max_retries})..."
+                    )
                     await asyncio.sleep(5)
             finally:
                 if self._session:
@@ -174,7 +194,7 @@ class DiscordChannel(BaseChannel):
             return
 
         async for msg in self._ws:
-            logger.debug(f"Discord WS message type: {msg.type}")
+            logger.trace(f"Discord WS message type: {msg.type}")
             if msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)

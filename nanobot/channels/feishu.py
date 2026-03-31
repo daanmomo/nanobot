@@ -226,8 +226,64 @@ class FeishuChannel(BaseChannel):
             elements.append({"tag": "markdown", "content": remaining})
         return elements or [{"tag": "markdown", "content": content}]
 
+    # Maximum characters per card (Feishu card limit ~30KB, ~4000 chars to be safe with tables/JSON overhead)
+    _MAX_CARD_CHARS = 4000
+
+    @staticmethod
+    def _split_content(content: str, max_chars: int) -> list[str]:
+        """Split long content into chunks, preferring to break at section boundaries.
+
+        Tries to split at '---' (horizontal rule), then '## ' (heading), then '\n\n' (paragraph).
+        """
+        if len(content) <= max_chars:
+            return [content]
+
+        chunks = []
+        remaining = content
+
+        while remaining:
+            if len(remaining) <= max_chars:
+                chunks.append(remaining)
+                break
+
+            # Find the best split point within max_chars
+            segment = remaining[:max_chars]
+            split_point = -1
+
+            # Priority 1: split at '---' (section divider)
+            idx = segment.rfind("\n---\n")
+            if idx > max_chars // 4:  # Don't split too early
+                split_point = idx + 1  # Keep the --- on the previous chunk's end
+
+            # Priority 2: split at '## ' (heading)
+            if split_point == -1:
+                idx = segment.rfind("\n## ")
+                if idx > max_chars // 4:
+                    split_point = idx + 1  # Start new chunk with the heading
+
+            # Priority 3: split at '\n\n' (paragraph)
+            if split_point == -1:
+                idx = segment.rfind("\n\n")
+                if idx > max_chars // 4:
+                    split_point = idx + 1
+
+            # Priority 4: split at '\n' (any newline)
+            if split_point == -1:
+                idx = segment.rfind("\n")
+                if idx > max_chars // 4:
+                    split_point = idx + 1
+
+            # Fallback: hard cut
+            if split_point == -1:
+                split_point = max_chars
+
+            chunks.append(remaining[:split_point].rstrip())
+            remaining = remaining[split_point:].lstrip()
+
+        return chunks
+
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Feishu."""
+        """Send a message through Feishu. Auto-splits long messages into multiple cards."""
         if not self._client:
             logger.warning("Feishu client not initialized")
             return
@@ -239,14 +295,25 @@ class FeishuChannel(BaseChannel):
         else:
             receive_id_type = "open_id"
 
-        # Try sending as interactive card first
-        success = await self._send_card(msg.chat_id, receive_id_type, msg.content)
-        if success:
-            return
+        # Split long content into chunks
+        chunks = self._split_content(msg.content, self._MAX_CARD_CHARS)
+        total = len(chunks)
 
-        # Fallback: send as plain text
-        logger.info("Card failed, falling back to plain text")
-        await self._send_text(msg.chat_id, receive_id_type, msg.content)
+        for i, chunk in enumerate(chunks):
+            # Add part indicator for multi-part messages
+            if total > 1:
+                chunk = f"**({i + 1}/{total})**\n\n{chunk}"
+
+            # Try sending as interactive card first
+            success = await self._send_card(msg.chat_id, receive_id_type, chunk)
+            if not success:
+                # Fallback: send as plain text
+                logger.info(f"Card failed for part {i + 1}/{total}, falling back to plain text")
+                await self._send_text(msg.chat_id, receive_id_type, chunk)
+
+            # Small delay between multi-part messages to maintain order
+            if total > 1 and i < total - 1:
+                await asyncio.sleep(0.5)
 
     async def _send_card(self, chat_id: str, receive_id_type: str, content: str) -> bool:
         """Send message as interactive card. Returns True on success."""

@@ -146,20 +146,6 @@ class QQConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public access)
 
 
-class WeChatConfig(BaseModel):
-    """WeChat channel configuration."""
-    enabled: bool = False
-    mode: str = "websocket"  # "websocket" or "wechaty"
-    # WebSocket bridge mode
-    bridge_url: str = "ws://localhost:3002"  # WebSocket bridge URL
-    # Wechaty mode
-    wechaty_token: str = ""  # Wechaty Puppet Service token
-    wechaty_endpoint: str = ""  # Wechaty Puppet Service endpoint
-    # Behavior
-    require_mention_in_group: bool = False  # Require @mention in group chat
-    allow_from: list[str] = Field(default_factory=list)  # Allowed wxids
-
-
 class WeComConfig(BaseModel):
     """企业微信 (WeCom/WeChat Work) channel configuration."""
     model_config = ConfigDict(populate_by_name=True)
@@ -190,7 +176,6 @@ class ChannelsConfig(BaseModel):
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
-    wechat: WeChatConfig = Field(default_factory=WeChatConfig)
     wecom: WeComConfig = Field(default_factory=WeComConfig)  # 企业微信
 
 

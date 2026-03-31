@@ -47,6 +47,7 @@ for _module, _attr in [
     ("nanobot.agent.tools.forex", "FOREX_TOOLS"),
     ("nanobot.agent.tools.news", "NEWS_TOOLS"),
     ("nanobot.agent.tools.browser", "BROWSER_TOOLS"),
+    ("nanobot.agent.tools.openbb", "OPENBB_TOOLS"),
 ]:
     try:
         _mod = __import__(_module, fromlist=[_attr])

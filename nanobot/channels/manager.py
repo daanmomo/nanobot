@@ -141,18 +141,6 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning(f"QQ channel not available: {e}")
 
-        # WeChat channel
-        if self.config.channels.wechat.enabled:
-            try:
-                from nanobot.channels.wechat import WeChatChannel
-                self.channels["wechat"] = WeChatChannel(
-                    self.config.channels.wechat,
-                    self.bus,
-                )
-                logger.info("WeChat channel enabled")
-            except ImportError as e:
-                logger.warning(f"WeChat channel not available: {e}")
-
         # WeCom (企业微信) channel
         if self.config.channels.wecom.enabled:
             try:

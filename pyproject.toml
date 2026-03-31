@@ -47,6 +47,9 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "ruff>=0.1.0",
 ]
+openbb = [
+    "openbb[all]>=4.0.0",
+]
 
 [project.scripts]
 nanobot = "nanobot.cli.commands:app"
