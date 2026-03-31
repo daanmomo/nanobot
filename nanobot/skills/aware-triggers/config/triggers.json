@@ -1,0 +1,21 @@
+{
+  "triggers": [
+    {
+      "name": "example_monitor",
+      "type": "poll",
+      "config": {
+        "url": "https://httpbin.org/json",
+        "json_path": "$.slideshow.title",
+        "fire_on": "change",
+        "interval_seconds": 300
+      },
+      "reason": "示例：监控 httpbin JSON 响应变化",
+      "is_enabled": false,
+      "max_fires": null,
+      "cooldown_seconds": 60,
+      "expires_at": null,
+      "focus_ref": null
+    }
+  ],
+  "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/4a70789f-f9ae-4e7b-bcde-95811b96a3c9"
+}
