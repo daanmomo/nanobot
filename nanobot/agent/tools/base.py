@@ -40,7 +40,7 @@ class Tool(ABC):
         pass
     
     @abstractmethod
-    async def execute(self, **kwargs: Any) -> str:
+    async def execute(self, **kwargs: Any) -> "str | list[dict[str, Any]]":
         """
         Execute the tool with given parameters.
         
@@ -48,7 +48,12 @@ class Tool(ABC):
             **kwargs: Tool-specific parameters.
         
         Returns:
-            String result of the tool execution.
+            String result, or a list of content blocks for multimodal results.
+            Multimodal format (for returning images):
+            [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}},
+                {"type": "text", "text": "Description of the image"}
+            ]
         """
         pass
 

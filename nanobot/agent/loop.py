@@ -1,4 +1,10 @@
-"""Agent loop: the core processing engine."""
+"""Agent loop: the core processing engine.
+
+v2 — Enhanced with Hermes-inspired patterns:
+  1. ErrorClassifier + structured retry/recovery
+  2. ContextCompressor + automatic context management
+  3. Parallel tool execution for independent tools
+"""
 
 from __future__ import annotations
 
@@ -15,7 +21,10 @@ if TYPE_CHECKING:
 
 from typing import Awaitable, Callable
 
+from nanobot.agent.compressor import ContextCompressor
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.error_classifier import ClassifiedError, FailoverReason, classify_api_error
+from nanobot.agent.parallel import execute_parallel, should_parallelize
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -38,6 +47,10 @@ from nanobot.session.manager import SessionManager
 # 流式回调类型: (channel, chat_id, content, is_final) -> bool (True 表示已发送最终消息)
 StreamCallback = Callable[[str, str, str, bool], Awaitable[bool]]
 
+# Retry constants
+_MAX_RETRIES = 3
+_BASE_RETRY_DELAY = 1.0
+
 # Optional tools - import at module level, register if available
 _OPTIONAL_TOOL_MODULES: list[tuple[str, list]] = []
 for _module, _attr in [
@@ -48,6 +61,7 @@ for _module, _attr in [
     ("nanobot.agent.tools.news", "NEWS_TOOLS"),
     ("nanobot.agent.tools.browser", "BROWSER_TOOLS"),
     ("nanobot.agent.tools.openbb", "OPENBB_TOOLS"),
+    ("nanobot.agent.tools.screenshot", "SCREENSHOT_TOOLS"),
 ]:
     try:
         _mod = __import__(_module, fromlist=[_attr])
@@ -60,12 +74,10 @@ class AgentLoop:
     """
     The agent loop is the core processing engine.
 
-    It:
-    1. Receives messages from the bus
-    2. Builds context with history, memory, skills
-    3. Calls the LLM
-    4. Executes tool calls
-    5. Sends responses back
+    Enhanced with:
+    - Structured error classification and recovery (Hermes-inspired)
+    - Automatic context compression when token usage is high
+    - Parallel tool execution for independent read-only tools
     """
 
     def __init__(
@@ -76,6 +88,7 @@ class AgentLoop:
         model: str | None = None,
         max_iterations: int = 50,
         max_tokens: int = 8192,
+        max_context_tokens: int = 200000,
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         tencent_config: "TencentSearchConfig | None" = None,
@@ -107,6 +120,14 @@ class AgentLoop:
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+        )
+
+        # Context compressor (Hermes-inspired)
+        self.compressor = ContextCompressor(
+            max_context_tokens=max_context_tokens,
+            compress_threshold=0.5,
+            keep_first=2,
+            keep_last=10,
         )
 
         self._running = False
@@ -199,17 +220,8 @@ class AgentLoop:
         logger.info("Agent loop stopping")
 
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
-        """
-        Process a single inbound message.
-
-        Args:
-            msg: The inbound message to process.
-
-        Returns:
-            The response message, or None if no response needed.
-        """
+        """Process a single inbound message."""
         # Handle system messages (subagent announces)
-        # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
             return await self._process_system_message(msg)
 
@@ -220,19 +232,9 @@ class AgentLoop:
         session = self.sessions.get_or_create(msg.session_key)
 
         # Update tool contexts
-        message_tool = self.tools.get("message")
-        if isinstance(message_tool, MessageTool):
-            message_tool.set_context(msg.channel, msg.chat_id)
+        self._update_tool_contexts(msg.channel, msg.chat_id)
 
-        spawn_tool = self.tools.get("spawn")
-        if isinstance(spawn_tool, SpawnTool):
-            spawn_tool.set_context(msg.channel, msg.chat_id)
-
-        cron_tool = self.tools.get("cron")
-        if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(msg.channel, msg.chat_id)
-
-        # Build initial messages (use get_history for LLM-formatted messages)
+        # Build initial messages
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=msg.content,
@@ -248,60 +250,8 @@ class AgentLoop:
             "started": False,
         }
 
-        # Agent loop
-        iteration = 0
-        final_content = None
-
-        while iteration < self.max_iterations:
-            iteration += 1
-
-            # Call LLM with streaming
-            response = await self._call_llm_stream(messages)
-
-            # Handle tool calls
-            if response.has_tool_calls:
-                # Add assistant message with tool calls
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)  # Must be JSON string
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
-                )
-
-                # Execute tools
-                for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"[Tool] {tool_call.name}({args_str[:200]})")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
-                # Interleaved CoT: reflect before next action
-                messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
-            else:
-                # No tool calls, we're done
-                final_content = response.content
-                break
-
-        if final_content is None:
-            # Force a final summary by calling LLM without tools
-            logger.info("[AgentLoop] Max iterations reached, forcing final summary")
-            messages.append({
-                "role": "user",
-                "content": "You have reached the maximum number of iterations. "
-                           "Summarize what you have done and provide your final response to the user.",
-            })
-            summary_response = await self._call_llm_stream(messages, tools_override=None)
-            final_content = summary_response.content or "I've completed processing but have no response to give."
+        # Run the agent loop with error recovery
+        final_content = await self._run_agent_loop(messages)
 
         # Log final response
         logger.info(f"[Assistant] {final_content}")
@@ -311,7 +261,6 @@ class AgentLoop:
         if self._stream_callback and self._current_stream_ctx:
             ctx = self._current_stream_ctx
             try:
-                # 回调返回 True 表示已经发送了最终消息，不需要再发送 OutboundMessage
                 stream_handled = await self._stream_callback(ctx["channel"], ctx["chat_id"], final_content, True)
             except Exception as e:
                 logger.warning(f"Final stream callback error: {e}")
@@ -324,7 +273,6 @@ class AgentLoop:
         session.add_message("assistant", final_content)
         self.sessions.save(session)
 
-        # 如果流式回调已经发送了最终内容，就不需要再发送 OutboundMessage
         if stream_handled:
             return None
 
@@ -332,14 +280,228 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
-            metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
+            metadata=msg.metadata or {},
         )
+
+    def _update_tool_contexts(self, channel: str, chat_id: str) -> None:
+        """Update tool contexts for the current message."""
+        message_tool = self.tools.get("message")
+        if isinstance(message_tool, MessageTool):
+            message_tool.set_context(channel, chat_id)
+
+        spawn_tool = self.tools.get("spawn")
+        if isinstance(spawn_tool, SpawnTool):
+            spawn_tool.set_context(channel, chat_id)
+
+        cron_tool = self.tools.get("cron")
+        if isinstance(cron_tool, CronTool):
+            cron_tool.set_context(channel, chat_id)
+
+    async def _run_agent_loop(self, messages: list[dict]) -> str:
+        """Run the main agent loop with error recovery and context compression.
+
+        Returns:
+            Final response content string.
+        """
+        iteration = 0
+        final_content = None
+
+        while iteration < self.max_iterations:
+            iteration += 1
+
+            # ── Context compression check ──
+            if self.compressor.should_compress(messages):
+                logger.info(f"[AgentLoop] Compressing context at iteration {iteration}")
+                messages = self.compressor.compress(messages)
+
+            # ── Call LLM with error recovery ──
+            response = await self._call_llm_with_recovery(messages)
+
+            if response is None:
+                # Unrecoverable error
+                final_content = "I encountered an error I couldn't recover from. Please try again."
+                break
+
+            # ── Handle tool calls ──
+            if response.has_tool_calls:
+                # Add assistant message with tool calls
+                tool_call_dicts = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments)
+                        }
+                    }
+                    for tc in response.tool_calls
+                ]
+                messages = self.context.add_assistant_message(
+                    messages, response.content, tool_call_dicts,
+                    reasoning_content=response.reasoning_content,
+                )
+
+                # Execute tools (parallel if safe, sequential otherwise)
+                messages = await self._execute_tools(messages, response.tool_calls)
+
+                # Interleaved CoT
+                messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
+
+                # Update compressor with usage info
+                if response.usage:
+                    self.compressor.should_compress(messages, usage=response.usage)
+            else:
+                final_content = response.content
+                break
+
+        if final_content is None:
+            # Max iterations reached — force summary
+            logger.info("[AgentLoop] Max iterations reached, forcing final summary")
+            messages.append({
+                "role": "user",
+                "content": "You have reached the maximum number of iterations. "
+                           "Summarize what you have done and provide your final response to the user.",
+            })
+            summary_response = await self._call_llm_with_recovery(messages, tools_override=None)
+            if summary_response and summary_response.content:
+                final_content = summary_response.content
+            else:
+                final_content = "I've completed processing but have no response to give."
+
+        return final_content
+
+    async def _call_llm_with_recovery(
+        self,
+        messages: list[dict],
+        tools_override: list[dict] | None = ...,
+    ) -> LLMResponse | None:
+        """Call LLM with structured error recovery.
+
+        Implements Hermes-inspired error classification and recovery:
+        - Rate limit → exponential backoff + retry
+        - Context overflow → compress + retry
+        - Server error → retry with backoff
+        - Auth/billing → abort (not recoverable without new credentials)
+        - Timeout → retry with increased timeout
+
+        Args:
+            messages: Conversation messages.
+            tools_override: Tool definitions override.
+
+        Returns:
+            LLMResponse on success, None if unrecoverable.
+        """
+        last_error: Exception | None = None
+
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                return await self._call_llm_stream(messages, tools_override)
+
+            except Exception as e:
+                last_error = e
+
+                # Classify the error
+                classified = classify_api_error(
+                    e,
+                    approx_tokens=self.compressor.last_token_estimate,
+                    context_length=self.compressor.max_context_tokens,
+                    num_messages=len(messages),
+                )
+
+                logger.warning(
+                    f"[Recovery] Attempt {attempt + 1}/{_MAX_RETRIES + 1} failed: "
+                    f"reason={classified.reason.value}, "
+                    f"status={classified.status_code}, "
+                    f"retryable={classified.retryable}, "
+                    f"msg={classified.message[:100]}"
+                )
+
+                # ── Non-retryable errors → abort immediately ──
+                if not classified.retryable:
+                    logger.error(
+                        f"[Recovery] Non-retryable error: {classified.reason.value} — "
+                        f"{classified.message[:200]}"
+                    )
+                    return None
+
+                # ── Last attempt → give up ──
+                if attempt >= _MAX_RETRIES:
+                    logger.error(
+                        f"[Recovery] Max retries ({_MAX_RETRIES}) exhausted for "
+                        f"{classified.reason.value}"
+                    )
+                    return None
+
+                # ── Context overflow → compress and retry ──
+                if classified.should_compress:
+                    logger.info("[Recovery] Compressing context due to overflow")
+                    messages = self.compressor.compress(messages)
+                    # No delay needed — just retry with smaller context
+                    continue
+
+                # ── Retryable errors → backoff and retry ──
+                delay = classified.retry_delay * (2 ** attempt)  # Exponential backoff
+                logger.info(f"[Recovery] Retrying in {delay:.1f}s...")
+                await asyncio.sleep(delay)
+
+        # Should not reach here, but just in case
+        logger.error(f"[Recovery] Unexpected fallthrough, last error: {last_error}")
+        return None
+
+    async def _execute_tools(
+        self,
+        messages: list[dict],
+        tool_calls: list[ToolCallRequest],
+    ) -> list[dict]:
+        """Execute tool calls, using parallel execution when safe.
+
+        Args:
+            messages: Current message list (will be modified in place).
+            tool_calls: Tool calls from the LLM response.
+
+        Returns:
+            Updated message list with tool results appended.
+        """
+        # Build tool call info for parallel check
+        tc_infos = [
+            {
+                "id": tc.id,
+                "name": tc.name,
+                "arguments": tc.arguments,
+            }
+            for tc in tool_calls
+        ]
+
+        if len(tool_calls) > 1 and should_parallelize(tc_infos):
+            # ── Parallel execution ──
+            logger.info(f"[Tools] Executing {len(tool_calls)} tools in parallel")
+            results = await execute_parallel(
+                tc_infos,
+                executor=self.tools.execute,
+            )
+            for tc_id, tc_name, result in results:
+                args_str = json.dumps(
+                    next((tc.arguments for tc in tool_calls if tc.id == tc_id), {}),
+                    ensure_ascii=False,
+                )
+                logger.info(f"[Tool] {tc_name}({args_str[:200]})")
+                messages = self.context.add_tool_result(messages, tc_id, tc_name, result)
+        else:
+            # ── Sequential execution ──
+            for tool_call in tool_calls:
+                args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                logger.info(f"[Tool] {tool_call.name}({args_str[:200]})")
+                result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                messages = self.context.add_tool_result(
+                    messages, tool_call.id, tool_call.name, result
+                )
+
+        return messages
 
     async def _call_llm_stream(
         self, messages: list[dict], tools_override: list[dict] | None = ...,
     ) -> LLMResponse:
-        """
-        Call LLM with streaming and log reasoning/content in real-time.
+        """Call LLM with streaming and log reasoning/content in real-time.
 
         Args:
             messages: The conversation messages.
@@ -357,7 +519,7 @@ class AgentLoop:
         chunks: list[StreamChunk] = []
         reasoning_buffer = ""
         content_buffer = ""
-        full_content = ""  # 累积的完整内容
+        full_content = ""
 
         async for chunk in self.provider.chat_stream(
             messages=messages,
@@ -370,7 +532,6 @@ class AgentLoop:
             # Log reasoning (thinking) in real-time
             if chunk.reasoning_content:
                 reasoning_buffer += chunk.reasoning_content
-                # Log each line as it completes
                 while "\n" in reasoning_buffer:
                     line, reasoning_buffer = reasoning_buffer.split("\n", 1)
                     if line.strip():
@@ -381,7 +542,6 @@ class AgentLoop:
                 content_buffer += chunk.content
                 full_content += chunk.content
 
-                # 触发流式回调
                 if self._stream_callback and self._current_stream_ctx:
                     ctx = self._current_stream_ctx
                     try:
@@ -391,7 +551,6 @@ class AgentLoop:
                     except Exception as e:
                         logger.warning(f"Stream callback error: {e}")
 
-                # Log each line as it completes
                 while "\n" in content_buffer:
                     line, content_buffer = content_buffer.split("\n", 1)
                     if line.strip():
@@ -409,7 +568,7 @@ class AgentLoop:
         else:
             response = self._assemble_chunks(chunks)
 
-        # Log detailed model output
+        # Log model output
         logger.info(f"[LLM Response] finish_reason={response.finish_reason}")
         if response.usage:
             logger.info(
@@ -417,6 +576,8 @@ class AgentLoop:
                 f"completion_tokens={response.usage.get('completion_tokens', 0)}, "
                 f"total_tokens={response.usage.get('total_tokens', 0)}"
             )
+            # Update compressor with actual token usage
+            self.compressor.last_token_estimate = response.usage.get('prompt_tokens', 0)
         if response.reasoning_content:
             logger.info(f"[LLM Reasoning] {response.reasoning_content}")
         if response.content:
@@ -481,13 +642,7 @@ class AgentLoop:
         )
 
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
-        """
-        Process a system message (e.g., subagent announce).
-
-        The chat_id field contains "original_channel:original_chat_id" to route
-        the response back to the correct destination.
-        """
-        # Log system message input
+        """Process a system message (e.g., subagent announce)."""
         logger.info(f"[System:{msg.sender_id}] {msg.content}")
 
         # Parse origin from chat_id (format: "channel:chat_id")
@@ -496,28 +651,16 @@ class AgentLoop:
             origin_channel = parts[0]
             origin_chat_id = parts[1]
         else:
-            # Fallback
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
 
-        # Use the origin session for context
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
 
         # Update tool contexts
-        message_tool = self.tools.get("message")
-        if isinstance(message_tool, MessageTool):
-            message_tool.set_context(origin_channel, origin_chat_id)
+        self._update_tool_contexts(origin_channel, origin_chat_id)
 
-        spawn_tool = self.tools.get("spawn")
-        if isinstance(spawn_tool, SpawnTool):
-            spawn_tool.set_context(origin_channel, origin_chat_id)
-
-        cron_tool = self.tools.get("cron")
-        if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(origin_channel, origin_chat_id)
-
-        # Build messages with the announce content
+        # Build messages
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=msg.content,
@@ -525,61 +668,12 @@ class AgentLoop:
             chat_id=origin_chat_id,
         )
 
-        # Agent loop (limited for announce handling)
-        iteration = 0
-        final_content = None
+        # Run agent loop with full error recovery
+        final_content = await self._run_agent_loop(messages)
 
-        while iteration < self.max_iterations:
-            iteration += 1
-
-            # Call LLM with streaming
-            response = await self._call_llm_stream(messages)
-
-            if response.has_tool_calls:
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
-                )
-
-                for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"[Tool] {tool_call.name}({args_str[:200]})")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
-                # Interleaved CoT: reflect before next action
-                messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
-            else:
-                final_content = response.content
-                break
-
-        if final_content is None:
-            # Force a final summary by calling LLM without tools
-            logger.info("[AgentLoop] Max iterations reached, forcing final summary")
-            messages.append({
-                "role": "user",
-                "content": "You have reached the maximum number of iterations. "
-                           "Summarize what you have done and provide your final response to the user.",
-            })
-            summary_response = await self._call_llm_stream(messages, tools_override=None)
-            final_content = summary_response.content or "Background task completed."
-
-        # Log final response
         logger.info(f"[Assistant] {final_content}")
 
-        # Save to session (mark as system message in history)
+        # Save to session
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
         session.add_message("assistant", final_content)
         self.sessions.save(session)
@@ -597,18 +691,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
     ) -> str:
-        """
-        Process a message directly (for CLI or cron usage).
-
-        Args:
-            content: The message content.
-            session_key: Session identifier.
-            channel: Source channel (for context).
-            chat_id: Source chat ID (for context).
-
-        Returns:
-            The agent's response.
-        """
+        """Process a message directly (for CLI or cron usage)."""
         msg = InboundMessage(
             channel=channel,
             sender_id="user",

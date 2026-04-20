@@ -197,7 +197,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         messages: list[dict[str, Any]],
         tool_call_id: str,
         tool_name: str,
-        result: str
+        result: "str | list[dict[str, Any]]"
     ) -> list[dict[str, Any]]:
         """
         Add a tool result to the message list.
@@ -206,7 +206,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
             messages: Current message list.
             tool_call_id: ID of the tool call.
             tool_name: Name of the tool.
-            result: Tool execution result.
+            result: Tool execution result (string or multimodal content list).
         
         Returns:
             Updated message list.

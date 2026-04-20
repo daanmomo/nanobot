@@ -3,8 +3,10 @@
 import asyncio
 import json
 import re
+import tempfile
 import threading
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -22,6 +24,7 @@ try:
         CreateMessageRequest,
         CreateMessageRequestBody,
         Emoji,
+        GetImageRequest,
         P2ImMessageReceiveV1,
         PatchMessageRequest,
         PatchMessageRequestBody,
@@ -528,6 +531,56 @@ class FeishuChannel(BaseChannel):
 
         return success
 
+    # ==================== 图片下载支持 ====================
+
+    _IMAGE_CACHE_DIR = Path(tempfile.gettempdir()) / "nanobot_feishu_images"
+
+    def _download_image_sync(self, image_key: str) -> str | None:
+        """
+        Download image from Feishu by image_key. Returns local file path or None.
+        
+        Uses GET /open-apis/im/v1/images/{image_key} via lark-oapi SDK.
+        """
+        if not self._client or not FEISHU_AVAILABLE:
+            return None
+
+        try:
+            # Ensure cache directory exists
+            self._IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+            # Check cache first
+            cached = self._IMAGE_CACHE_DIR / f"{image_key}.png"
+            if cached.exists() and cached.stat().st_size > 0:
+                logger.debug(f"Feishu image cache hit: {image_key}")
+                return str(cached)
+
+            # Download via SDK
+            request = GetImageRequest.builder().image_key(image_key).build()
+            response = self._client.im.v1.image.get(request)
+
+            if not response.success():
+                logger.warning(f"Failed to download image {image_key}: code={response.code}, msg={response.msg}")
+                return None
+
+            # Write to file
+            image_data = response.file.read() if hasattr(response.file, 'read') else response.file
+            if not image_data:
+                logger.warning(f"Empty image data for {image_key}")
+                return None
+
+            cached.write_bytes(image_data)
+            logger.info(f"Feishu image downloaded: {image_key} ({len(image_data)} bytes)")
+            return str(cached)
+
+        except Exception as e:
+            logger.error(f"Error downloading Feishu image {image_key}: {e}")
+            return None
+
+    async def _download_image(self, image_key: str) -> str | None:
+        """Async wrapper for image download."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._download_image_sync, image_key)
+
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
         """
         Sync handler for incoming messages (called from WebSocket thread).
@@ -566,16 +619,60 @@ class FeishuChannel(BaseChannel):
             # Add reaction to indicate "seen"
             await self._add_reaction(message_id, "THUMBSUP")
 
-            # Parse message content
+            # Parse message content and handle media
+            media: list[str] = []
+
             if msg_type == "text":
                 try:
                     content = json.loads(message.content).get("text", "")
                 except json.JSONDecodeError:
                     content = message.content or ""
+            elif msg_type == "image":
+                # Extract image_key and download the image
+                content = "[image]"
+                try:
+                    image_key = json.loads(message.content).get("image_key", "")
+                    if image_key:
+                        local_path = await self._download_image(image_key)
+                        if local_path:
+                            media.append(local_path)
+                            content = "用户发送了一张图片，请查看并描述/分析图片内容。"
+                        else:
+                            content = "[image] (图片下载失败)"
+                except (json.JSONDecodeError, Exception) as e:
+                    logger.warning(f"Failed to parse image content: {e}")
+                    content = "[image] (图片解析失败)"
+            elif msg_type == "post":
+                # Rich text (post) may contain images inline
+                try:
+                    post_data = json.loads(message.content)
+                    # Extract text from post content
+                    parts = []
+                    for lang_content in post_data.values():
+                        title = lang_content.get("title", "")
+                        if title:
+                            parts.append(title)
+                        for line in lang_content.get("content", []):
+                            for element in line:
+                                tag = element.get("tag", "")
+                                if tag == "text":
+                                    parts.append(element.get("text", ""))
+                                elif tag == "a":
+                                    parts.append(element.get("text", "") + " " + element.get("href", ""))
+                                elif tag == "img":
+                                    img_key = element.get("image_key", "")
+                                    if img_key:
+                                        local_path = await self._download_image(img_key)
+                                        if local_path:
+                                            media.append(local_path)
+                    content = "\n".join(parts) if parts else "[post]"
+                except (json.JSONDecodeError, Exception) as e:
+                    logger.warning(f"Failed to parse post content: {e}")
+                    content = "[post]"
             else:
                 content = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
 
-            if not content:
+            if not content and not media:
                 return
 
             # Forward to message bus
@@ -584,6 +681,7 @@ class FeishuChannel(BaseChannel):
                 sender_id=sender_id,
                 chat_id=reply_to,
                 content=content,
+                media=media if media else None,
                 metadata={
                     "message_id": message_id,
                     "chat_type": chat_type,
