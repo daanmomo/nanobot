@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 from typing import Awaitable, Callable
 
 from nanobot.agent.compressor import ContextCompressor
+from nanobot.agent.doom_loop import LEVEL_BREAK, LEVEL_OK, DoomLoopDetector
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.error_classifier import ClassifiedError, FailoverReason, classify_api_error
 from nanobot.agent.parallel import execute_parallel, should_parallelize

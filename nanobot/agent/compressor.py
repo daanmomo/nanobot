@@ -266,3 +266,162 @@ class ContextCompressor:
                 summary_parts.extend(parts)
 
         return "\n".join(summary_parts) if summary_parts else "(No significant content to summarize)"
+
+
+class SmartCompressor(ContextCompressor):
+    """LLM-powered context compressor — uses a cheap model for intelligent summarization.
+
+    Inspired by HuggingFace ml-intern's 170K compaction and Pi's context management.
+    Falls back to mechanical summarization if LLM call fails.
+
+    Args:
+        cheap_model: Model to use for summarization (e.g. "deepseek-chat", "gpt-4o-mini").
+        provider: LLM provider instance. If None, will be set later via set_provider().
+        **kwargs: Passed to ContextCompressor.
+    """
+
+    def __init__(
+        self,
+        cheap_model: str = "deepseek-chat",
+        provider: Any = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.cheap_model = cheap_model
+        self._provider = provider
+        self._smart_available = True  # disable after repeated failures
+
+    def set_provider(self, provider: Any) -> None:
+        """Set the LLM provider (called by AgentLoop after init)."""
+        self._provider = provider
+
+    def compress(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Compress with LLM summarization, falling back to mechanical."""
+        if len(messages) <= self.keep_first + self.keep_last + 2:
+            logger.info("[SmartCompressor] Too few messages to compress, skipping")
+            return messages
+
+        self.compression_count += 1
+
+        # Split messages
+        system_msg = messages[0] if messages[0]["role"] == "system" else None
+        start_idx = 1 if system_msg else 0
+        first_end = start_idx + self.keep_first
+        last_start = len(messages) - self.keep_last
+
+        if first_end >= last_start:
+            return messages
+
+        first_msgs = messages[start_idx:first_end]
+        middle_msgs = messages[first_end:last_start]
+        last_msgs = messages[last_start:]
+
+        # Try smart summarization first, fall back to mechanical
+        if self._smart_available and self._provider:
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # We're inside an async context — schedule coroutine
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        summary = pool.submit(
+                            asyncio.run, self._smart_summarize(middle_msgs)
+                        ).result(timeout=30)
+                else:
+                    summary = asyncio.run(self._smart_summarize(middle_msgs))
+                logger.info(f"[SmartCompressor] LLM summarized {len(middle_msgs)} messages")
+            except Exception as e:
+                logger.warning(f"[SmartCompressor] LLM summarization failed: {e}, falling back")
+                self._smart_fail_count = getattr(self, '_smart_fail_count', 0) + 1
+                if self._smart_fail_count >= 3:
+                    logger.warning("[SmartCompressor] Too many failures, disabling smart mode")
+                    self._smart_available = False
+                summary = self._summarize_messages(middle_msgs)
+        else:
+            summary = self._summarize_messages(middle_msgs)
+
+        # Reconstruct
+        compressed = []
+        if system_msg:
+            compressed.append(system_msg)
+        compressed.extend(first_msgs)
+        compressed.append({
+            "role": "user",
+            "content": (
+                f"[Context compressed — summary of {len(middle_msgs)} previous messages]\n\n"
+                f"{summary}\n\n"
+                f"[End of compressed context. Continue from here.]"
+            ),
+        })
+        compressed.extend(last_msgs)
+
+        old_tokens = estimate_messages_tokens(messages)
+        new_tokens = estimate_messages_tokens(compressed)
+        logger.info(
+            f"[SmartCompressor] Messages: {len(messages)} → {len(compressed)}, "
+            f"Est. tokens: {old_tokens:,} → {new_tokens:,} "
+            f"(saved ~{old_tokens - new_tokens:,})"
+        )
+        return compressed
+
+    async def _smart_summarize(self, messages: list[dict[str, Any]]) -> str:
+        """Use a cheap LLM to produce a high-quality summary."""
+        # Format messages for the summarizer
+        formatted = []
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            tool_calls = msg.get("tool_calls", [])
+
+            if isinstance(content, str) and content.strip():
+                # Truncate very long content
+                display = content[:2000] + "..." if len(content) > 2000 else content
+                formatted.append(f"[{role}] {display}")
+
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    func = tc.get("function", {})
+                    name = func.get("name", "")
+                    args = func.get("arguments", "")
+                    if isinstance(args, str) and len(args) > 500:
+                        args = args[:500] + "..."
+                    formatted.append(f"[{role}] called {name}({args})")
+
+        conversation_text = "\n".join(formatted)
+        # Limit input to ~8K tokens worth
+        if len(conversation_text) > 32000:
+            conversation_text = conversation_text[:16000] + "\n...\n" + conversation_text[-16000:]
+
+        summary_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a conversation summarizer. Produce a concise but complete summary. "
+                    "You MUST preserve:\n"
+                    "1. Key decisions and conclusions reached\n"
+                    "2. File paths that were read, created, or modified\n"
+                    "3. Important tool results (especially errors)\n"
+                    "4. User requirements and preferences expressed\n"
+                    "5. Code snippets or configurations that are still relevant\n"
+                    "6. Any unresolved questions or pending tasks\n\n"
+                    "Format as bullet points. Be factual, not verbose. Max 1000 words."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Summarize this conversation segment:\n\n{conversation_text}",
+            },
+        ]
+
+        response = await self._provider.chat(
+            messages=summary_messages,
+            model=self.cheap_model,
+            max_tokens=2000,
+        )
+
+        if hasattr(response, "content") and response.content:
+            return response.content
+        elif isinstance(response, dict):
+            return response.get("content", "") or response.get("text", "")
+        return str(response)
