@@ -380,15 +380,8 @@ class LiteLLMProvider(LLMProvider):
                     logger.info("[ProxyFix] Retry succeeded!")
                     return self._parse_response(response)
                 except Exception as retry_e:
-                    return LLMResponse(
-                        content=f"Error calling LLM (retry failed): {str(retry_e)}",
-                        finish_reason="error",
-                    )
-            # Return error as content for graceful handling
-            return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
-                finish_reason="error",
-            )
+                    raise retry_e from e
+            raise
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
@@ -506,17 +499,9 @@ class LiteLLMProvider(LLMProvider):
                     response = await acompletion(**kwargs)
                     logger.info("[ProxyFix] Stream retry succeeded!")
                 except Exception as retry_e:
-                    yield StreamChunk(
-                        content=f"Error calling LLM (retry failed): {str(retry_e)}",
-                        finish_reason="error",
-                    )
-                    return
+                    raise retry_e from e
             else:
-                yield StreamChunk(
-                    content=f"Error calling LLM: {str(e)}",
-                    finish_reason="error",
-                )
-                return
+                raise
 
         try:
             # Track accumulated tool calls for assembly

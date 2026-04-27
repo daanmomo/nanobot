@@ -1,5 +1,6 @@
 """Session management module."""
 
-from nanobot.session.manager import SessionManager, Session
+from nanobot.session.manager import SessionManager
+from nanobot.session.tree import TreeSession
 
-__all__ = ["SessionManager", "Session"]
+__all__ = ["SessionManager", "TreeSession"]

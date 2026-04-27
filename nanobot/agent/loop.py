@@ -1,15 +1,20 @@
 """Agent loop: the core processing engine.
 
-v2 — Enhanced with Hermes-inspired patterns:
+v3 — Enhanced with Hermes-inspired patterns:
   1. ErrorClassifier + structured retry/recovery
   2. ContextCompressor + automatic context management
   3. Parallel tool execution for independent tools
+  4. Redact — sensitive info masking in tool output & logs
+  5. Smart Router — cheap model for simple messages
+  6. Trajectory — conversation saving for analysis & training
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -25,7 +30,11 @@ from nanobot.agent.compressor import ContextCompressor
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.error_classifier import ClassifiedError, FailoverReason, classify_api_error
 from nanobot.agent.parallel import execute_parallel, should_parallelize
+from nanobot.agent.router import choose_model
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tool_router import select_tool_names
+from nanobot.agent.trajectory import save_trajectory
+from nanobot.utils.redact import redact, redact_tool_output
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -129,6 +138,12 @@ class AgentLoop:
             keep_first=2,
             keep_last=10,
         )
+
+        # Smart model routing (Hermes-inspired)
+        # Set cheap_model via NANOBOT_CHEAP_MODEL env var or config
+        self.cheap_model = os.environ.get("NANOBOT_CHEAP_MODEL", None)
+        # Trajectory saving (Hermes-inspired)
+        self.save_trajectories = os.environ.get("NANOBOT_SAVE_TRAJECTORIES", "true").lower() not in ("0", "false", "no")
 
         self._running = False
         # 流式输出回调 (channel, chat_id, content, is_final) -> None
@@ -250,8 +265,16 @@ class AgentLoop:
             "started": False,
         }
 
+        # Smart model routing (Hermes-inspired)
+        turn_model, routing_reason = choose_model(msg.content, self.model, self.cheap_model)
+        if routing_reason:
+            logger.info(f"[Router] Routed to {turn_model} (reason: {routing_reason})")
+
+        # Track timing for trajectory
+        _start_time = time.monotonic()
+
         # Run the agent loop with error recovery
-        final_content = await self._run_agent_loop(messages)
+        final_content = await self._run_agent_loop(messages, model_override=turn_model)
 
         # Log final response
         logger.info(f"[Assistant] {final_content}")
@@ -297,7 +320,7 @@ class AgentLoop:
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(channel, chat_id)
 
-    async def _run_agent_loop(self, messages: list[dict]) -> str:
+    async def _run_agent_loop(self, messages: list[dict], model_override: str | None = None) -> str:
         """Run the main agent loop with error recovery and context compression.
 
         Returns:
@@ -314,8 +337,22 @@ class AgentLoop:
                 logger.info(f"[AgentLoop] Compressing context at iteration {iteration}")
                 messages = self.compressor.compress(messages)
 
+            # ── Dynamic tool selection (Pi-inspired) ──
+            selected_names = select_tool_names(self.tools.tool_names, messages)
+            all_count = len(self.tools)
+            sel_count = len(selected_names)
+            if sel_count < all_count:
+                filtered_defs = self.tools.get_definitions_filtered(selected_names)
+                logger.info(
+                    f"[ToolRouter] Selected {sel_count}/{all_count} tools "
+                    f"(saved {all_count - sel_count} tool defs)"
+                )
+            else:
+                filtered_defs = ...  # sentinel: use all tools
+                logger.debug(f"[ToolRouter] Using all {all_count} tools")
+
             # ── Call LLM with error recovery ──
-            response = await self._call_llm_with_recovery(messages)
+            response = await self._call_llm_with_recovery(messages, tools_override=filtered_defs, model_override=model_override)
 
             if response is None:
                 # Unrecoverable error
@@ -362,7 +399,7 @@ class AgentLoop:
                 "content": "You have reached the maximum number of iterations. "
                            "Summarize what you have done and provide your final response to the user.",
             })
-            summary_response = await self._call_llm_with_recovery(messages, tools_override=None)
+            summary_response = await self._call_llm_with_recovery(messages, tools_override=None, model_override=model_override)
             if summary_response and summary_response.content:
                 final_content = summary_response.content
             else:
@@ -374,6 +411,7 @@ class AgentLoop:
         self,
         messages: list[dict],
         tools_override: list[dict] | None = ...,
+        model_override: str | None = None,
     ) -> LLMResponse | None:
         """Call LLM with structured error recovery.
 
@@ -395,7 +433,7 @@ class AgentLoop:
 
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                return await self._call_llm_stream(messages, tools_override)
+                return await self._call_llm_stream(messages, tools_override, model_override=model_override)
 
             except Exception as e:
                 last_error = e
@@ -500,6 +538,7 @@ class AgentLoop:
 
     async def _call_llm_stream(
         self, messages: list[dict], tools_override: list[dict] | None = ...,
+        model_override: str | None = None,
     ) -> LLMResponse:
         """Call LLM with streaming and log reasoning/content in real-time.
 
@@ -524,7 +563,7 @@ class AgentLoop:
         async for chunk in self.provider.chat_stream(
             messages=messages,
             tools=tool_defs,
-            model=self.model,
+            model=model_override or self.model,
             max_tokens=self.max_tokens,
         ):
             chunks.append(chunk)

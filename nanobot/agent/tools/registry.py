@@ -34,6 +34,18 @@ class ToolRegistry:
     def get_definitions(self) -> list[dict[str, Any]]:
         """Get all tool definitions in OpenAI format."""
         return [tool.to_schema() for tool in self._tools.values()]
+
+    def get_definitions_filtered(self, names: list[str]) -> list[dict[str, Any]]:
+        """Get tool definitions for a subset of tools by name.
+
+        Args:
+            names: List of tool names to include.
+
+        Returns:
+            Tool definitions in OpenAI format, filtered to only the given names.
+        """
+        name_set = set(names)
+        return [tool.to_schema() for name, tool in self._tools.items() if name in name_set]
     
     async def execute(self, name: str, params: dict[str, Any]) -> "str | list[dict[str, Any]]":
         """

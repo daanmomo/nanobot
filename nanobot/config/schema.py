@@ -185,7 +185,7 @@ class AgentDefaults(BaseModel):
     model: str = "deepseek/deepseek-chat"  # Default to DeepSeek
     max_tokens: int = 8192
     temperature: float = 0.7
-    max_tool_iterations: int = 20
+    max_tool_iterations: int = 50
     memory_window: int = 20
 
 
