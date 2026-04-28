@@ -649,6 +649,11 @@ class FeishuChannel(BaseChannel):
                     # Extract text from post content
                     parts = []
                     for lang_content in post_data.values():
+                        if not isinstance(lang_content, dict):
+                            # Some post formats have string values (e.g. "title" at top level)
+                            if isinstance(lang_content, str) and lang_content:
+                                parts.append(lang_content)
+                            continue
                         title = lang_content.get("title", "")
                         if title:
                             parts.append(title)
